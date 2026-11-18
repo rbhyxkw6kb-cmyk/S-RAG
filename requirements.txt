@@ -1,0 +1,16 @@
+-r requirements-local.txt
+
+# 原 Milvus / BGE 检索模块的额外依赖
+redis>=5.0.4
+pymilvus>=2.4.0
+whoosh>=2.7.4
+jieba>=0.42.1
+langchain>=0.2.0
+langchain-community>=0.2.0
+sentence-transformers>=2.7.0
+FlagEmbedding>=1.2.0
+
+# 运行时建议：
+# - GPU 环境下可使用 CUDA 版本的 torch / transformers
+# - 若显存不足，可改用更小的 embedding/reranker 模型
+

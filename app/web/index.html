@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#12332f">
+  <title>知源 · 产线作业助手</title>
+  <link rel="stylesheet" href="/assets/styles.css">
+  <script src="/assets/app.js" defer></script>
+</head>
+<body>
+  <header class="top">
+    <div class="brand"><span class="mark" aria-hidden="true">知</span><span>知源<span class="brand-divider"> / </span><span class="brand-detail">产线作业助手</span></span></div>
+    <span id="mode" class="mode">正在连接</span>
+  </header>
+  <main class="layout">
+    <aside class="library" aria-labelledby="library-title">
+      <div class="library-heading">
+        <h2 id="library-title">作业指导书</h2>
+        <span id="count" class="count">0 份</span>
+      </div>
+      <div id="import-controls" hidden>
+      <form id="upload">
+        <label for="file">指导书文件 <small>.xlsx、.xlsm、.pdf</small></label>
+        <input id="file" name="file" type="file" accept=".xlsx,.xlsm,.pdf" required>
+        <label for="upload-station">所属工位 <small>可选</small></label>
+        <input id="upload-station" name="station" maxlength="80" placeholder="例如 WS1001">
+        <button class="primary" type="submit">导入指导书</button>
+      </form>
+      <button class="secondary" id="scan" type="button">扫描 dataset 文件夹</button>
+      </div>
+      <p id="import-status" class="status" role="status"></p>
+      <ul id="manuals" class="manuals"></ul>
+    </aside>
+    <section class="workspace" aria-labelledby="work-title">
+      <div class="work-heading">
+        <div><h1 id="work-title">工位作业问答</h1><p>从作业指导书查找操作步骤、检查要求和注意事项。</p></div>
+        <button id="reset" class="secondary" type="button">新对话</button>
+      </div>
+      <div class="scope">
+        <label for="station">检索范围</label>
+        <select id="station"><option value="">全部工位</option></select>
+      </div>
+      <div class="messages" id="messages" aria-live="polite" aria-label="问答记录">
+        <div id="welcome" class="welcome">
+          <span class="welcome-icon" aria-hidden="true">⌕</span>
+          <h2>今天要查哪项操作？</h2>
+          <p id="welcome-hint">导入作业指导书后，输入工位、设备或操作名称进行查询。</p>
+        </div>
+      </div>
+      <form id="chat" class="composer">
+        <label for="question" class="sr-only">作业问题</label>
+        <textarea id="question" rows="2" maxlength="1000" required placeholder="例如：A01 工位装配前要检查什么？"></textarea>
+        <button class="primary" type="submit">发送</button>
+      </form>
+    </section>
+  </main>
+</body>
+</html>
