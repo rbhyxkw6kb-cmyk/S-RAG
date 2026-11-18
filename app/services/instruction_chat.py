@@ -1,15 +1,20 @@
 import json
 import logging
 import re
+import unicodedata
 from collections import OrderedDict
+from contextlib import AsyncExitStack
+from pathlib import Path
+from time import monotonic
 from typing import Literal
 from urllib.parse import urlsplit
 
+import anyio
 import httpx
 from pydantic import BaseModel, Field
-from starlette.concurrency import run_in_threadpool
 
 from app.core.config import settings
+from app.core.resilience import ModelGuard, ModelUnavailable, model_deadline
 from app.generator.citation_parser import parse_citations
 from app.generator.prompt_builder import EVIDENCE_PROMPT, SYSTEM_PROMPT, build_chat_prompt, build_context_prompt, passage_text
 from app.services.instruction_library import STATION_CODE, InstructionLibrary, station_codes
@@ -26,6 +31,60 @@ DIRECT_STEP_QUESTION = re.compile(
 )
 UNANCHORED_STEP = re.compile(rf"(?:那|再|那再)?[，,\s]*(?P<direction>{STEP_WORD}){STEP_WORD_QUESTION}")
 TRAILING_STEP_LINK = re.compile(r"(?:之后|以后|后面|后|之前|以前|前|的)$")
+STEP_ORDINAL = r"[0-9零〇一二两三四五六七八九十百]{1,6}"
+STEP_REFERENCE = re.compile(
+    rf"第\s*({STEP_ORDINAL})\s*(?:个)?步(?:骤)?"
+    rf"|步骤\s*({STEP_ORDINAL})(?=$|[\s：:、，,。？！?!]|是|怎|要|有|的|前|后|用|需|应|和|及|与)"
+)
+CHINESE_DIGITS = dict(zip("零一二三四五六七八九", range(10))) | {"〇": 0, "两": 2}
+
+
+def step_references(question: str) -> set[int]:
+    numbers = set()
+    for match in STEP_REFERENCE.finditer(unicodedata.normalize("NFKC", question)):
+        label = match[1] or match[2]
+        if label.isdecimal():
+            numbers.add(int(label))
+        elif all(char in CHINESE_DIGITS for char in label):
+            numbers.add(int("".join(str(CHINESE_DIGITS[char]) for char in label)))
+        elif all(char in CHINESE_DIGITS or char in "十百" for char in label):
+            total = 0
+            digit = None
+            for char in label:
+                if char in "十百":
+                    total += (1 if digit is None else digit) * (10 if char == "十" else 100)
+                    digit = None
+                else:
+                    digit = CHINESE_DIGITS[char]
+            numbers.add(total + (digit or 0))
+    return numbers - {0}
+
+
+def choice_key(text: str) -> str:
+    return re.sub(r"[\W_]+", "", unicodedata.normalize("NFKC", text).casefold())
+
+
+def clarification_choice(query: str, choices: list[dict], scope: str) -> dict | None:
+    reply = choice_key(query)
+    ordinal = re.fullmatch(r"第?([1-5一二三四五])(?:个|项)?", reply)
+    if ordinal:
+        digit = ordinal[1]
+        index = int(digit) if digit.isdecimal() else CHINESE_DIGITS[digit]
+        if 1 <= index <= len(choices) and (not scope or choices[index - 1]["station"] == scope):
+            return choices[index - 1]
+        return None
+    reply = re.sub(r"^(?:我选|就选|选|我要查|就查)|(?:那个|那项|那道工序)$", "", reply)
+    matches = []
+    for item in choices:
+        if scope and item["station"] != scope:
+            continue
+        title = Path(item["source"]).stem
+        names = re.findall(r"[\u3400-\u9fff]{2,}", f'{title} {item["sheet"]}')
+        aliases = [item["label"], item["sheet"], item["source"], title,
+                   item["station"] + item["sheet"], *names]
+        if reply and any(reply == choice_key(alias) for alias in aliases):
+            matches.append(item)
+    return matches[0] if len(matches) == 1 else None
 PLAN_PROMPT = """你是产线知识库的检索规划器。理解问题和最近对话，只输出 JSON。
 intent 只能是 lookup、next、previous、clarify。
 问当前操作之后或之前的步骤时用 next 或 previous。明确追问上一轮已核对的步骤时，
@@ -53,12 +112,40 @@ class QueryPlan(BaseModel):
 
 
 class InstructionChat:
-    def __init__(self, library: InstructionLibrary):
+    def __init__(self, library: InstructionLibrary, client: httpx.AsyncClient | None = None):
         self.library = library
+        self.client = client
+        self.model_guard = ModelGuard()
+        self.query_workers = anyio.CapacityLimiter(settings.query_worker_threads)
         self.sessions: OrderedDict[tuple[str, str], list[str]] = OrderedDict()
 
     async def answer(self, query: str, station: str, session_id: str) -> dict:
-        if settings.uses_deepseek and settings.llm_configured:
+        token = model_deadline.set(monotonic() + settings.llm_budget_seconds)
+        try:
+            pending = await self.run_local(self.library.pending_step, session_id)
+            if pending:
+                codes = station_codes(query)
+                scope = station or (next(iter(codes)) if len(codes) == 1 else "")
+                await self.run_local(self.library.clear_pending_step, session_id)
+                if (len(codes) <= 1 and (not codes or scope.upper() in codes)
+                        and (not pending["station"] or not scope or pending["station"] == scope)):
+                    choice = clarification_choice(query, pending["choices"], scope)
+                    if choice:
+                        return await self.answer_step_reference(
+                            pending["question"], choice["station"], session_id, pending["step_number"], choice,
+                        )
+            return await self.answer_with_context(query, station, session_id)
+        finally:
+            model_deadline.reset(token)
+
+    async def run_local(self, function, *args):
+        return await anyio.to_thread.run_sync(function, *args, limiter=self.query_workers)
+
+    async def answer_with_context(self, query, station, session_id, *, use_model=True) -> dict:
+        numbers = step_references(query)
+        if len(numbers) == 1:
+            return await self.answer_step_reference(query, station, session_id, numbers.pop())
+        if use_model and settings.uses_deepseek and settings.llm_configured:
             return await self.deepseek_answer(query, station, session_id)
         question = query.strip(" \t？?。！!")
         followup = UNANCHORED_STEP.fullmatch(STATION_CODE.sub("", question).strip(" ：:，,"))
@@ -78,9 +165,9 @@ class InstructionChat:
                 action = TRAILING_STEP_LINK.sub("", direct["action"].rstrip(" ，,"))
                 direction = -1 if direct["direction"] == "上一步" else 1
             action = action.replace("装好", "安装").replace("装完", "安装")
-            step, message = await run_in_threadpool(self.library.adjacent_step, action, station, direction)
+            step, message = await self.run_local(self.library.adjacent_step, action, station, direction)
             return await self.sequence_result(session_id, step, message, direction)
-        documents = await run_in_threadpool(self.library.retrieve, query, 5, station)
+        documents = await self.run_local(self.library.retrieve, query, 5, station)
         if not documents:
             return {
                 "answer": "当前范围内没有找到相关作业指导书内容。可以补充工位编号、操作名称或设备名称。",
@@ -93,7 +180,8 @@ class InstructionChat:
         history = self.sessions.get(key, [])
         reason = ("尚未配置 DeepSeek API Key，以下是本机检索到的指导书原文。"
                   if settings.uses_deepseek else "当前未配置问答模型，以下引用可直接打开相关原文。")
-        if settings.llm_configured:
+        degradation = {}
+        if use_model and settings.llm_configured:
             try:
                 generated = await self.generate(query, documents, "\n".join(history))
                 citation_text = generated
@@ -122,13 +210,14 @@ class InstructionChat:
                     return {"answer": generated, "citations": citations,
                             "context_count": len(documents), "mode": "generated"}
                 reason = "模型未给出可核对的出处。请查看下列检索片段，或补充工位和操作名称。"
-            except (httpx.HTTPError, ValueError, TypeError, KeyError, IndexError) as exc:
+            except (ModelUnavailable, httpx.HTTPError, ValueError, TypeError, KeyError, IndexError) as exc:
                 logger.warning("问答模型调用失败：%s", type(exc).__name__)
                 reason = "问答模型目前不可用，仍可查看检索到的指导书原文。"
+                degradation["degraded_reason"] = exc.reason if isinstance(exc, ModelUnavailable) else "model_error"
 
         references = " ".join(f"[{number}]" for number in range(1, len(documents) + 1))
         return {"answer": reason, "citations": parse_citations(references, documents),
-                "context_count": len(documents), "mode": "sources"}
+                "context_count": len(documents), "mode": "sources", **degradation}
 
     def remember(self, key, query, answer):
         self.sessions[key] = (self.sessions.get(key, []) + [f"用户：{query}\n助手：{answer}"])[-5:]
@@ -138,21 +227,63 @@ class InstructionChat:
 
     async def remember_cited_step(self, session_id, documents, citations):
         step = documents[citations[0]["index"] - 1] if len(citations) == 1 else None
-        await run_in_threadpool(self.library.remember_step, session_id, step)
+        await self.run_local(self.library.remember_step, session_id, step)
 
     async def continue_step(self, session_id, station, offset):
-        anchor = await run_in_threadpool(self.library.last_step, session_id, station)
+        anchor = await self.run_local(self.library.last_step, session_id, station)
         if anchor is None:
             return None, "请告诉我你现在做到哪一步，或已经完成哪项操作。"
-        return await run_in_threadpool(self.library.adjacent_step, "", station, offset, [(1, anchor)])
+        return await self.run_local(self.library.adjacent_step, "", station, offset, [(1, anchor)])
 
     async def sequence_result(self, session_id, step, message, offset):
         if step is None:
             return self.no_answer(message)
-        await run_in_threadpool(self.library.remember_step, session_id, step)
+        await self.run_local(self.library.remember_step, session_id, step)
         label = "下一步" if offset == 1 else "上一步"
         return {"answer": f"指导书中的{label}是：\n{passage_text(step)} [1]",
                 "citations": parse_citations("[1]", [step]), "context_count": 1, "mode": "sequence"}
+
+    async def answer_step_reference(self, query, station, session_id, number, selected=None):
+        codes = station_codes(query)
+        if len(codes) > 1 or (station and codes and station.upper() not in codes):
+            return self.no_answer("请确认要查哪个工位，再查询步骤编号。")
+        scope = station or (codes.pop() if codes else "")
+        anchor = await self.run_local(self.library.last_step, session_id, scope)
+        step, choices = await self.run_local(
+            self.library.numbered_step, number, scope, query, anchor, selected["chunk_id"] if selected else None,
+        )
+        if selected and (step is None or any(
+            step.metadata[key] != selected[key] for key in ("sheet", "cell_range")
+        )):
+            return self.no_answer("刚才的候选步骤已变化，请重新查询步骤编号。")
+        if step is None:
+            if choices:
+                options = []
+                for item in choices:
+                    meta = item.metadata
+                    choice = {key: meta[key] for key in ("chunk_id", "station", "source", "sheet", "cell_range")}
+                    choice["label"] = f'{choice["station"]} · {choice["sheet"]} · {choice["cell_range"]}'.strip(" ·")
+                    options.append(choice)
+                labels = [option["label"] for option in options]
+                for option in options:
+                    if labels.count(option["label"]) > 1:
+                        option["label"] += f' · {option["source"]}'
+                await self.run_local(self.library.remember_pending_step, session_id, scope, query, number, options)
+                return {**self.no_answer(f"有多处第 {number} 步。请补充工序或工作表名称。"), "choices": options}
+            return self.no_answer(f"现有可检索的 Excel 指导书中未找到第 {number} 步。请核对工位、工序或步骤编号。")
+        question = query.strip(" \t？?。！!")
+        relative = STEP_QUESTION.fullmatch(question)
+        direct = DIRECT_STEP_QUESTION.fullmatch(question) if not relative else None
+        if relative or direct:
+            previous = relative["relation"].endswith("前") if relative else direct["direction"] == "上一步"
+            offset = -1 if previous else 1
+            following, message = await self.run_local(
+                self.library.adjacent_step, "", scope, offset, [(1, step)]
+            )
+            return await self.sequence_result(session_id, following, message, offset)
+        await self.run_local(self.library.remember_step, session_id, step)
+        return {"answer": f"指导书第 {number} 步：\n{passage_text(step)} [1]",
+                "citations": parse_citations("[1]", [step]), "context_count": 1, "mode": "step_lookup"}
 
     async def deepseek_answer(self, query, station, session_id):
         codes = station_codes(query)
@@ -168,7 +299,7 @@ class InstructionChat:
                 intent = "previous" if followup["direction"] == "上一步" else "next"
                 plan = QueryPlan(intent=intent, search_query="", use_previous_step=True)
             else:
-                last = await run_in_threadpool(self.library.last_step, session_id, scope)
+                last = await self.run_local(self.library.last_step, session_id, scope)
                 anchor = passage_text(last) if last else "无"
                 plan = QueryPlan.model_validate_json(await self.complete(
                     PLAN_PROMPT, f"最近对话：\n{history}\n上一轮已核对的步骤：{anchor}\n当前问题：{query}",
@@ -187,8 +318,8 @@ class InstructionChat:
                     step, message = await self.continue_step(session_id, scope, offset)
                     candidates = []
                 else:
-                    candidates = await run_in_threadpool(self.library.numbered_candidates, action, scope)
-                    step, message = await run_in_threadpool(self.library.adjacent_step, action, scope, offset, candidates)
+                    candidates = await self.run_local(self.library.numbered_candidates, action, scope)
+                    step, message = await self.run_local(self.library.adjacent_step, action, scope, offset, candidates)
                 top = [item for item in candidates if item[0] == candidates[0][0]][:6] if candidates else []
                 if step is None and len(top) > 1:
                     # 只有无法确定相邻步骤时，才让模型根据完整问题消歧。
@@ -198,17 +329,17 @@ class InstructionChat:
                         use_json=True, max_tokens=100,
                     ))["anchor"]
                     if type(decision) is int and 1 <= decision <= len(top):
-                        step, message = await run_in_threadpool(
+                        step, message = await self.run_local(
                             self.library.adjacent_step, action, scope, offset, [top[decision - 1]],
                         )
                 if step is None:
                     return self.no_answer(message)
                 documents = [step]
             else:
-                documents = await run_in_threadpool(self.library.retrieve, query, 5, scope)
+                documents = await self.run_local(self.library.retrieve, query, 5, scope)
                 rewritten = STATION_CODE.sub("", plan.search_query).strip()
                 if rewritten and rewritten != query:
-                    extra = await run_in_threadpool(self.library.retrieve, rewritten, 5, scope)
+                    extra = await self.run_local(self.library.retrieve, rewritten, 5, scope)
                     indexed = {doc.metadata["chunk_id"]: doc for doc in documents + extra}
                     order = self.library.fuse([doc.metadata["chunk_id"] for doc in documents],
                                               [doc.metadata["chunk_id"] for doc in extra])
@@ -227,16 +358,22 @@ class InstructionChat:
             elif sequence:
                 return await self.sequence_result(session_id, documents[0], "", offset)
             return result
-        except (httpx.HTTPError, ValueError, TypeError, KeyError, IndexError) as exc:
-            logger.warning("DeepSeek 问答失败：%s", type(exc).__name__)
+        except (ModelUnavailable, httpx.HTTPError, ValueError, TypeError, KeyError, IndexError) as exc:
+            reason = exc.reason if isinstance(exc, ModelUnavailable) else "model_error"
+            if not isinstance(exc, ModelUnavailable):
+                logger.warning("DeepSeek 问答失败：%s", type(exc).__name__)
             if sequence and documents:
-                return await self.sequence_result(session_id, documents[0], "", offset)
+                result = await self.sequence_result(session_id, documents[0], "", offset)
+                return {**result, "degraded_reason": reason}
             if not documents:
-                documents = await run_in_threadpool(self.library.retrieve, query, 5, scope)
+                result = await self.answer_with_context(query, scope, session_id, use_model=False)
+                if result["mode"] == "sources":
+                    result["answer"] = "当前为原文检索模式。请查看下方检索到的原文。"
+                return {**result, "degraded_reason": reason}
             references = " ".join(f"[{idx}]" for idx in range(1, len(documents) + 1))
             return {"answer": "DeepSeek 暂未返回可核对的回答。可查看下方检索到的原文。",
                     "citations": parse_citations(references, documents),
-                    "context_count": len(documents), "mode": "sources"}
+                    "context_count": len(documents), "mode": "sources", "degraded_reason": reason}
 
     @staticmethod
     def no_answer(message: str) -> dict:
@@ -275,13 +412,25 @@ class InstructionChat:
         return await self.complete(system_prompt, user_prompt, use_json=settings.llm_evidence_only,
                                    max_tokens=settings.llm_max_tokens)
 
-    async def complete(self, system_prompt, user_prompt, *, use_json, max_tokens):
+    @staticmethod
+    def create_client() -> httpx.AsyncClient:
         endpoint = urlsplit(settings.llm_base_url)
         local = endpoint.hostname in {"localhost", "127.0.0.1", "::1"}
+        return httpx.AsyncClient(
+            timeout=httpx.Timeout(settings.llm_budget_seconds, connect=settings.llm_connect_seconds),
+            limits=httpx.Limits(max_connections=settings.llm_max_inflight,
+                                max_keepalive_connections=settings.llm_max_inflight),
+            trust_env=not local,
+        )
+
+    async def complete(self, system_prompt, user_prompt, *, use_json, max_tokens):
         payload = {"response_format": {"type": "json_object"}} if use_json else {}
         if settings.uses_deepseek:
             payload["thinking"] = {"type": "disabled"}
-        async with httpx.AsyncClient(timeout=60, trust_env=not local) as client:
+        deadline = model_deadline.get() or monotonic() + settings.llm_budget_seconds
+        async with AsyncExitStack() as stack:
+            await stack.enter_async_context(self.model_guard.call(deadline))
+            client = self.client or await stack.enter_async_context(self.create_client())
             response = await client.post(
                 f"{settings.llm_base_url.rstrip('/')}/chat/completions",
                 headers={"Authorization": f"Bearer {settings.llm_token}"},

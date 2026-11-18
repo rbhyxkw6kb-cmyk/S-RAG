@@ -8,6 +8,7 @@ const question = $("question");
 const importStatus = $("import-status");
 const ask = chat.querySelector("button");
 let sessionId = null;
+let activeChoices = null;
 
 function element(tag, text, className) {
   const item = document.createElement(tag);
@@ -128,19 +129,48 @@ function addCitations(message, citations) {
     row.append(sourceLink(label, citation.pdf_url || citation.file_url, Boolean(citation.pdf_url)));
     if (citation.station) row.append(element("p", citation.station));
     row.append(element("p", citation.snippet));
+    for (const figure of citation.figures || []) {
+      const item = element("figure", "", "citation-figure");
+      const caption = `指导书图例 · ${figure.anchor}`;
+      const link = sourceLink("", figure.url, true);
+      link.setAttribute("aria-label", `打开${caption}`);
+      const picture = element("img", "");
+      picture.src = figure.url;
+      picture.alt = caption;
+      picture.loading = "lazy";
+      picture.decoding = "async";
+      link.append(picture);
+      item.append(link, element("figcaption", caption));
+      row.append(item);
+    }
     list.append(row);
   }
   message.append(list);
 }
 
-chat.addEventListener("submit", async (event) => {
-  event.preventDefault();
-  const query = question.value.trim();
+function addChoices(message, choices) {
+  if (!choices?.length) return;
+  const group = element("div", "", "choices");
+  group.setAttribute("role", "group");
+  group.setAttribute("aria-label", "选择工序");
+  choices.forEach((choice, index) => {
+    const button = element("button", choice.label, "secondary");
+    button.type = "button";
+    button.addEventListener("click", () => submitQuestion(`第 ${index + 1} 项`, choice.label));
+    group.append(button);
+  });
+  message.append(group);
+  activeChoices = group;
+}
+
+async function submitQuestion(query, display = query) {
   if (!query || ask.disabled) return;
   const scope = station.value;
+  const previousChoices = activeChoices;
+  previousChoices?.querySelectorAll("button").forEach((button) => { button.disabled = true; });
   ask.disabled = $("reset").disabled = station.disabled = true;
   question.value = "";
-  appendMessage(scope ? `${scope}\n${query}` : query, "user");
+  appendMessage(scope ? `${scope}\n${display}` : display, "user");
   const reply = appendMessage("正在查找作业指导书…");
   try {
     const result = await api("/api/chat", {
@@ -150,18 +180,30 @@ chat.addEventListener("submit", async (event) => {
     });
     sessionId = result.session_id;
     reply.firstElementChild.textContent = result.answer;
+    if (result.degraded_reason) {
+      reply.append(element("small", "模型暂不可用，已使用本机指导书。", "status"));
+    }
+    activeChoices = null;
     addCitations(reply, result.citations);
+    addChoices(reply, result.choices);
     messages.scrollTop = reply.offsetTop - 12;
   } catch (error) {
     reply.firstElementChild.textContent = `查询失败：${error.message}`;
     if (!question.value) question.value = query;
+    previousChoices?.querySelectorAll("button").forEach((button) => { button.disabled = false; });
   } finally {
     ask.disabled = $("reset").disabled = station.disabled = false;
   }
+}
+
+chat.addEventListener("submit", (event) => {
+  event.preventDefault();
+  submitQuestion(question.value.trim());
 });
 
 $("reset").addEventListener("click", () => {
   sessionId = null;
+  activeChoices = null;
   messages.replaceChildren(welcome);
   question.value = "";
   question.focus();
@@ -172,7 +214,9 @@ api("/health")
     const vectors = status.vectors;
     const semantic = vectors?.indexed > 0;
     const search = semantic ? "混合检索" : "关键词检索";
-    if (status.model_provider === "deepseek") {
+    if (status.load?.model?.state === "open") {
+      $("mode").textContent = `${search} · 模型暂不可用`;
+    } else if (status.model_provider === "deepseek") {
       $("mode").textContent = status.model_configured ? `${search} · DeepSeek` : `${search} · DeepSeek 待配置`;
     } else {
       $("mode").textContent = status.model_configured ? `${search} · 问答` : search;

@@ -1,4 +1,5 @@
 import hashlib
+import json
 import logging
 import re
 import sqlite3
@@ -7,8 +8,13 @@ from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path, PureWindowsPath
 from time import time
+from xml.etree.ElementTree import ParseError
+from zipfile import BadZipFile
+
+from openpyxl.utils.cell import range_boundaries
 
 from app.core.config import settings
+from app.parser.excel_figures import Figure, extract_excel_figures
 from app.parser.excel_parser import ExcelParser
 from app.parser.pdf_parser import PDFParser
 from app.retriever.local_embeddings import LocalEmbeddings, LocalReranker
@@ -67,10 +73,12 @@ def split_text(text: str):
 class InstructionLibrary:
     def __init__(self, path: str):
         self.path = Path(path)
+        self.session_db = self.path.with_name(f"{self.path.stem}.sessions.sqlite3")
         self.embeddings = LocalEmbeddings(settings.rag_embedding_model) if settings.rag_embedding_model else None
         self.reranker = LocalReranker() if settings.rag_reranker_model else None
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with closing(self.connect()) as db, db:
+            db.execute("PRAGMA journal_mode=WAL")
             db.executescript("""
                 CREATE TABLE IF NOT EXISTS manuals (
                     id TEXT PRIMARY KEY, source TEXT NOT NULL, station TEXT NOT NULL,
@@ -91,18 +99,51 @@ class InstructionLibrary:
                 CREATE TABLE IF NOT EXISTS passage_vectors (
                     passage_id INTEGER PRIMARY KEY, model_id TEXT NOT NULL, vector BLOB NOT NULL
                 );
-                CREATE TABLE IF NOT EXISTS session_steps (
-                    session_id TEXT PRIMARY KEY, doc_id TEXT NOT NULL,
-                    passage_id INTEGER NOT NULL, sheet TEXT NOT NULL,
-                    cell_range TEXT NOT NULL, expires_at INTEGER NOT NULL
+                CREATE TABLE IF NOT EXISTS figure_indexes (doc_id TEXT PRIMARY KEY);
+                CREATE TABLE IF NOT EXISTS excel_figures (
+                    id INTEGER PRIMARY KEY, doc_id TEXT NOT NULL, sheet TEXT NOT NULL,
+                    first_row INTEGER NOT NULL, last_row INTEGER NOT NULL,
+                    anchor TEXT NOT NULL, png BLOB NOT NULL
                 );
+                CREATE INDEX IF NOT EXISTS excel_figures_source
+                ON excel_figures(doc_id, sheet, first_row, last_row);
             """)
             columns = {column["name"] for column in db.execute("PRAGMA table_info(manuals)")}
             if "index_version" not in columns:
                 db.execute("ALTER TABLE manuals ADD COLUMN index_version INTEGER NOT NULL DEFAULT 1")
+        with closing(self.connect_sessions()) as db, db:
+            db.execute("PRAGMA journal_mode=WAL")
+            db.execute("""
+                CREATE TABLE IF NOT EXISTS session_steps (
+                    session_id TEXT PRIMARY KEY, doc_id TEXT NOT NULL,
+                    passage_id INTEGER NOT NULL, sheet TEXT NOT NULL,
+                    cell_range TEXT NOT NULL, expires_at INTEGER NOT NULL
+                )
+            """)
+            db.execute("""
+                CREATE TABLE IF NOT EXISTS pending_step_queries (
+                    session_id TEXT PRIMARY KEY, station TEXT NOT NULL, question TEXT NOT NULL,
+                    step_number INTEGER NOT NULL, choices TEXT NOT NULL, expires_at INTEGER NOT NULL
+                )
+            """)
+            if db.execute("PRAGMA user_version").fetchone()[0] == 0:
+                # Import location-only memories once from installations using a single database.
+                db.execute("ATTACH DATABASE ? AS corpus", (str(self.path.resolve()),))
+                if db.execute("SELECT 1 FROM corpus.sqlite_master WHERE name = 'session_steps'").fetchone():
+                    db.execute("""
+                        INSERT OR IGNORE INTO session_steps
+                        SELECT session_id, doc_id, passage_id, sheet, cell_range, expires_at
+                        FROM corpus.session_steps WHERE expires_at > ?
+                    """, (int(time()),))
+                db.execute("PRAGMA user_version=1")
 
     def connect(self):
         db = sqlite3.connect(self.path, timeout=15)
+        db.row_factory = sqlite3.Row
+        return db
+
+    def connect_sessions(self):
+        db = sqlite3.connect(self.session_db, timeout=2)
         db.row_factory = sqlite3.Row
         return db
 
@@ -123,11 +164,16 @@ class InstructionLibrary:
         doc_id = hashlib.sha256(name.encode() + b"\0" + station.encode() + b"\0" + content).hexdigest()
         index_version = 2 if suffix in EXCEL_SUFFIXES else 1
         with closing(self.connect()) as db:
-            current = db.execute("SELECT active, index_version FROM manuals WHERE id = ?", (doc_id,)).fetchone()
-        if current and current["active"] and current["index_version"] == index_version:
+            current = db.execute("""
+                SELECT active, index_version, EXISTS(SELECT 1 FROM figure_indexes WHERE doc_id = manuals.id) AS figures
+                FROM manuals WHERE id = ?
+            """, (doc_id,)).fetchone()
+        unchanged = current and current["active"] and current["index_version"] == index_version
+        if unchanged and (current["figures"] or suffix == ".pdf"):
             return {"source": name, "status": "unchanged"}
 
         page_count = text_pages = sheet_count = 0
+        figures = None
         if suffix == ".pdf":
             pages = PDFParser.extract_pages(content)
             page_count = len(pages)
@@ -142,6 +188,15 @@ class InstructionLibrary:
                 raise ValueError("Excel 工作簿没有可检索的单元格内容。")
             parts = [(None, item.text, item.metadata["sheet"], item.metadata["cell_range"]) for item in elements]
             sheet_count = len({sheet for _, _, sheet, _ in parts})
+            if not current or not current["figures"]:
+                try:
+                    figures = extract_excel_figures(content, elements)
+                except (BadZipFile, ParseError, KeyError, OSError, ValueError):
+                    logger.warning("Unable to index the workbook drawings", exc_info=True)
+            if unchanged:
+                with closing(self.connect()) as db, db:
+                    self.save_figures(db, doc_id, figures)
+                return {"source": name, "status": "unchanged", "figures_indexed": len(figures or [])}
         title_terms = " ".join(search_terms(f"{Path(name).stem} {station}"))
         rows = [
             (page, chunk, " ".join(search_terms(chunk)), sheet, cell_range)
@@ -157,6 +212,7 @@ class InstructionLibrary:
                 (name, station),
             ).fetchone()
             if current and current["id"] == doc_id and current["index_version"] == index_version:
+                self.save_figures(db, doc_id, figures)
                 return {"source": name, "status": "unchanged"}
             if current:
                 db.execute("DELETE FROM passage_vectors WHERE passage_id IN "
@@ -181,6 +237,7 @@ class InstructionLibrary:
                 if vectors is not None:
                     db.execute("INSERT INTO passage_vectors VALUES (?, ?, ?)",
                                (cursor.lastrowid, self.embeddings.model_id, vectors[index]))
+            self.save_figures(db, doc_id, figures)
         return {"source": name, "status": "ready", "pages": page_count,
                 "text_pages": text_pages, "sheets": sheet_count}
 
@@ -215,6 +272,36 @@ class InstructionLibrary:
     def get_original(self, doc_id: str):
         with closing(self.connect()) as db:
             return db.execute("SELECT source, pdf AS content FROM manuals WHERE id = ?", (doc_id,)).fetchone()
+
+    @staticmethod
+    def save_figures(db, doc_id: str, figures: list[Figure] | None):
+        if figures is None or not db.execute("INSERT OR IGNORE INTO figure_indexes VALUES (?)", (doc_id,)).rowcount:
+            return
+        db.executemany("""
+            INSERT INTO excel_figures(doc_id, sheet, first_row, last_row, anchor, png)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, [(doc_id, item.sheet, item.first_row, item.last_row, item.anchor, item.png) for item in figures])
+
+    def get_figure(self, doc_id: str, figure_id: int):
+        with closing(self.connect()) as db:
+            return db.execute("SELECT png FROM excel_figures WHERE doc_id = ? AND id = ?",
+                              (doc_id, figure_id)).fetchone()
+
+    def add_citation_figures(self, citations: list[dict]):
+        with closing(self.connect()) as db:
+            for citation in citations:
+                if not citation.get("sheet") or not citation.get("cell_range"):
+                    continue
+                doc_id = citation["chunk_id"].split("_", 1)[0]
+                _, first, _, last = range_boundaries(citation["cell_range"])
+                images = db.execute("""
+                    SELECT id, anchor FROM excel_figures
+                    WHERE doc_id = ? AND sheet = ? AND first_row = ? AND last_row = ? ORDER BY id
+                """, (doc_id, citation["sheet"], first, last))
+                citation["figures"] = [
+                    {"url": f"/api/documents/{doc_id}/figures/{row['id']}", "anchor": row["anchor"]}
+                    for row in images
+                ]
 
     def encode(self, texts: list[str]) -> list[bytes]:
         try:
@@ -289,8 +376,75 @@ class InstructionLibrary:
                     candidates.append((overlap, passage))
         return sorted(candidates, key=lambda item: item[0], reverse=True)
 
+    def numbered_step(self, number: int, station: str, question: str,
+                      anchor: Passage | None = None, selected: str | None = None
+                      ) -> tuple[Passage | None, list[Passage]]:
+        with closing(self.connect()) as db:
+            rows = db.execute("""
+                SELECT p.rowid AS chunk, p.text, p.page, m.id, m.source, m.station, x.sheet, x.cell_range
+                FROM manuals m JOIN passages p ON p.doc_id = m.id
+                JOIN spreadsheet_locations x ON x.passage_id = p.rowid
+                WHERE m.active = 1 AND (? = '' OR m.station = ?) AND p.text GLOB 'A[0-9]*'
+                ORDER BY m.station, m.source, x.sheet, p.rowid
+            """, (station, station))
+            matches = []
+            for row in rows:
+                step = EXCEL_STEP.match(row["text"])
+                if step and int(step["number"]) == number:
+                    matches.append(self.make_passage(row, ["step_number"]))
+        if not matches:
+            return None, []
+        if selected is not None:
+            return next((item for item in matches if item.metadata["chunk_id"] == selected), None), []
+
+        # Prefer a process the user actually named, then the verified sheet of the current conversation.
+        def title_overlap(passage: Passage) -> int:
+            title = f'{Path(passage.metadata["source"]).stem} {passage.metadata["sheet"]}'
+            names = re.findall(r"[\u3400-\u9fff]{2,}", title)
+            return max((len(name) for name in names if name in question), default=0)
+
+        offered = max(map(title_overlap, matches))
+        if offered:
+            matches = [item for item in matches if title_overlap(item) == offered]
+        elif anchor:
+            on_same_sheet = [
+                item for item in matches
+                if (item.metadata["doc_id"], item.metadata["sheet"]) ==
+                   (anchor.metadata["doc_id"], anchor.metadata["sheet"])
+            ]
+            if not on_same_sheet:
+                return None, []
+            matches = on_same_sheet
+        if len(matches) == 1:
+            return matches[0], []
+        return None, matches[:5]
+
+    def remember_pending_step(self, session_id: str, station: str, question: str,
+                              number: int, choices: list[dict]) -> None:
+        now = int(time())
+        with closing(self.connect_sessions()) as db, db:
+            db.execute("DELETE FROM pending_step_queries WHERE expires_at <= ?", (now,))
+            db.execute("""
+                INSERT INTO pending_step_queries VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(session_id) DO UPDATE SET station = excluded.station, question = excluded.question,
+                    step_number = excluded.step_number, choices = excluded.choices, expires_at = excluded.expires_at
+            """, (session_id, station, question, number, json.dumps(choices, ensure_ascii=False),
+                  now + settings.session_ttl))
+
+    def pending_step(self, session_id: str) -> dict | None:
+        with closing(self.connect_sessions()) as db:
+            row = db.execute("SELECT * FROM pending_step_queries WHERE session_id = ? AND expires_at > ?",
+                             (session_id, int(time()))).fetchone()
+        if not row:
+            return None
+        return {**dict(row), "choices": json.loads(row["choices"])}
+
+    def clear_pending_step(self, session_id: str) -> None:
+        with closing(self.connect_sessions()) as db, db:
+            db.execute("DELETE FROM pending_step_queries WHERE session_id = ?", (session_id,))
+
     def remember_step(self, session_id: str, passage: Passage | None) -> None:
-        with closing(self.connect()) as db, db:
+        with closing(self.connect_sessions()) as db, db:
             if not passage or not passage.metadata["sheet"] or not EXCEL_STEP.match(passage.page_content):
                 db.execute("DELETE FROM session_steps WHERE session_id = ?", (session_id,))
                 return
@@ -305,15 +459,21 @@ class InstructionLibrary:
                   passage.metadata["sheet"], passage.metadata["cell_range"], now + settings.session_ttl))
 
     def last_step(self, session_id: str, station: str) -> Passage | None:
+        with closing(self.connect_sessions()) as db:
+            cursor = db.execute("""
+                SELECT doc_id, passage_id, sheet, cell_range FROM session_steps
+                WHERE session_id = ? AND expires_at > ?
+            """, (session_id, int(time()))).fetchone()
+        if not cursor:
+            return None
         with closing(self.connect()) as db:
             row = db.execute("""
                 SELECT p.rowid AS chunk, p.text, p.page, m.id, m.source, m.station, x.sheet, x.cell_range
-                FROM session_steps s JOIN passages p ON p.rowid = s.passage_id AND p.doc_id = s.doc_id
-                JOIN manuals m ON m.id = p.doc_id
-                JOIN spreadsheet_locations x ON x.passage_id = p.rowid AND x.doc_id = s.doc_id
-                    AND x.sheet = s.sheet AND x.cell_range = s.cell_range
-                WHERE s.session_id = ? AND s.expires_at > ? AND m.active = 1 AND (? = '' OR m.station = ?)
-            """, (session_id, int(time()), station, station)).fetchone()
+                FROM passages p JOIN manuals m ON m.id = p.doc_id
+                JOIN spreadsheet_locations x ON x.passage_id = p.rowid AND x.doc_id = p.doc_id
+                WHERE p.doc_id = ? AND p.rowid = ? AND x.sheet = ? AND x.cell_range = ?
+                    AND m.active = 1 AND (? = '' OR m.station = ?)
+            """, (*tuple(cursor), station, station)).fetchone()
         return self.make_passage(row, ["session"]) if row and EXCEL_STEP.match(row["text"]) else None
 
     def adjacent_step(self, action: str, station: str, offset: int, candidates=None) -> tuple[Passage | None, str]:

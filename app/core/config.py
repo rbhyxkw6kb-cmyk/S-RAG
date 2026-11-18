@@ -12,6 +12,9 @@ class Settings(BaseSettings):
     max_excel_mb: int = Field(default=128, ge=1)
     staff_password: SecretStr | None = None
     admin_password: SecretStr | None = None
+    query_max_inflight: int = Field(default=32, ge=1)
+    query_max_per_station: int = Field(default=4, ge=1)
+    query_worker_threads: int = Field(default=4, ge=1)
 
     # 嵌入模型
     embedding_model: str = "BAAI/bge-large-zh-v1.5"
@@ -44,6 +47,13 @@ class Settings(BaseSettings):
     llm_max_tokens: int = 2048
     llm_top_p: float = 0.9
     llm_evidence_only: bool = False
+    llm_max_inflight: int = Field(default=8, ge=1)
+    llm_requests_per_minute: int = Field(default=0, ge=0)
+    llm_queue_seconds: float = Field(default=0.2, ge=0, le=10)
+    llm_budget_seconds: float = Field(default=8.0, gt=0)
+    llm_connect_seconds: float = Field(default=2.0, gt=0)
+    llm_breaker_failures: int = Field(default=3, ge=1)
+    llm_breaker_cooldown: float = Field(default=15.0, gt=0)
     deepseek_api_key: SecretStr | None = Field(default=None, validation_alias="DEEPSEEK_API_KEY")
 
     @property

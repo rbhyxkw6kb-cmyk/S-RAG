@@ -7,6 +7,8 @@ from unittest.mock import AsyncMock, patch
 import httpx
 import pymupdf
 from openpyxl import Workbook
+from openpyxl.drawing.image import Image as ExcelImage
+from PIL import Image
 from pydantic import SecretStr
 
 from app.core.config import settings
@@ -31,6 +33,43 @@ class InstructionWorkflowTests(unittest.IsolatedAsyncioTestCase):
             setting = patch.object(settings, name, value)
             setting.start()
             self.addCleanup(setting.stop)
+
+    async def test_numbered_step_returns_its_own_excel_figure(self):
+        with tempfile.TemporaryDirectory() as folder, \
+             patch.object(settings, "knowledge_db", str(Path(folder) / "manuals.sqlite3")), \
+             patch.object(settings, "llm_model_name", ""):
+            workbook = Workbook()
+            workbook.active.title = "装配工序"
+            workbook.active["A1"] = "作业分解指导书"
+            workbook.active["B3"] = "图例"
+            workbook.active["A4"] = "1. 确认红色标记"
+            workbook.active["A5"] = "2. 核对蓝色标记"
+            for anchor, color in (("B4", "red"), ("B5", "blue")):
+                picture = io.BytesIO()
+                Image.new("RGB", (32, 32), color).save(picture, "PNG")
+                picture.seek(0)
+                workbook.active.add_image(ExcelImage(picture), anchor)
+            data = io.BytesIO()
+            workbook.save(data)
+            workbook.close()
+            files = {"file": ("sample.xlsx", data.getvalue())}
+            async with app.router.lifespan_context(app), httpx.AsyncClient(
+                transport=httpx.ASGITransport(app), base_url="http://test"
+            ) as client:
+                upload = await client.post("/api/documents/upload", data={"station": "WS1001"}, files=files)
+                self.assertEqual(upload.status_code, 200)
+                result = await client.post("/api/chat", json={
+                    "query": "第2步是什么", "station": "WS1001", "stream": False,
+                })
+                figures = result.json()["citations"][0]["figures"]
+                self.assertEqual([item["anchor"] for item in figures], ["B5"])
+                picture = await client.get(figures[0]["url"])
+                self.assertEqual(picture.headers["content-type"], "image/png")
+                with Image.open(io.BytesIO(picture.content)) as img:
+                    self.assertEqual(img.convert("RGB").getpixel((16, 16)), (0, 0, 255))
+                self.assertEqual((await client.get(figures[0]["url"].replace("/documents/", "/documents/other"))).status_code, 404)
+                second = await client.post("/api/documents/upload", data={"station": "WS1001"}, files=files)
+                self.assertEqual(second.json()["status"], "unchanged")
 
     async def test_staff_can_query_but_only_admin_can_import(self):
         with tempfile.TemporaryDirectory() as folder, \
@@ -173,6 +212,47 @@ class InstructionWorkflowTests(unittest.IsolatedAsyncioTestCase):
                             self.assertIn("将记录交给班组长", continued["answer"])
                             self.assertEqual(continued["citations"][0]["cell_range"], "A9")
                         self.assertEqual(responses, [])
+
+                    for query in ("第三步是什么", "请问步骤 3 是什么？", "第３步的操作是什么？"):
+                        with self.subTest(query=query):
+                            ordinal = await sequence(query)
+                            self.assertEqual(ordinal["mode"], "step_lookup")
+                            self.assertIn("将记录交给班组长", ordinal["answer"])
+                            self.assertEqual(ordinal["citations"][0]["cell_range"], "A9")
+                    next_number = await sequence("第2步后下一步是什么？")
+                    self.assertEqual(next_number["mode"], "sequence")
+                    self.assertEqual(next_number["citations"][0]["cell_range"], "A9")
+                    self.assertEqual((await sequence("第9步是什么"))["mode"], "no_match")
+
+                    alternative = Workbook()
+                    alternative.active.title = "点检工序"
+                    alternative.active["A3"] = "3. 核对点检卡"
+                    buffer = io.BytesIO()
+                    alternative.save(buffer)
+                    alternative.close()
+                    upload = await client.post("/api/documents/upload", data={"station": "WS1001"},
+                                               files={"file": ("点检工序.xlsx", buffer.getvalue())})
+                    self.assertEqual(upload.status_code, 200)
+                    uncertain = await sequence("第三步是什么")
+                    self.assertEqual(uncertain["mode"], "no_match")
+                    self.assertIn("请补充工序", uncertain["answer"])
+                    self.assertEqual(len(uncertain["choices"]), 2)
+                    with patch.object(app.state, "chat", InstructionChat(InstructionLibrary(settings.knowledge_db))):
+                        selected = await sequence("WS1001 · 点检工序", uncertain["session_id"])
+                    self.assertEqual(selected["mode"], "step_lookup")
+                    self.assertIn("核对点检卡", selected["answer"])
+                    self.assertEqual(selected["citations"][0]["sheet"], "点检工序")
+                    self.assertIsNone(app.state.library.pending_step(uncertain["session_id"]))
+
+                    uncertain = await sequence("第三步是什么")
+                    candidate = next(i for i, choice in enumerate(uncertain["choices"], 1)
+                                     if choice["sheet"] == "点检工序")
+                    selected = await sequence(f"第 {candidate} 项", uncertain["session_id"])
+                    self.assertEqual(selected["mode"], "step_lookup")
+                    self.assertEqual(selected["citations"][0]["sheet"], "点检工序")
+                    definite = await sequence("点检工序第三步是什么")
+                    self.assertEqual(definite["mode"], "step_lookup")
+                    self.assertIn("核对点检卡", definite["answer"])
                     download = await client.get(cite["file_url"])
                     self.assertEqual(download.content, original)
                     self.assertTrue(download.headers["Content-Disposition"].startswith("attachment"))

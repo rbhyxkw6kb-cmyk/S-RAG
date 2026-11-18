@@ -65,6 +65,12 @@ a { color: #0c624d; text-underline-offset: 3px; }
 .sources { list-style: none; margin: 12px 0 0; padding: 0; display: grid; gap: 8px; }
 .sources li { background: white; border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; }
 .sources p { margin-top: 5px; font-size: 13px; color: var(--muted); }
+.citation-figure { margin: 10px 0 0; }
+.citation-figure img { display: block; max-width: min(100%, 540px); height: auto; border-radius: 6px; }
+.citation-figure figcaption { margin-top: 4px; font-size: 13px; color: var(--muted); }
+.choices { display: grid; gap: 8px; margin-top: 10px; }
+.choices button { text-align: left; white-space: normal; overflow-wrap: anywhere; }
+.choices button:disabled { cursor: default; }
 .composer { display: flex; align-items: end; gap: 12px; padding: 16px 24px 20px; border-top: 1px solid var(--line); }
 .composer textarea { flex: 1; resize: vertical; min-height: 60px; max-height: 160px; }
 .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
